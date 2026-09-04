@@ -15,166 +15,155 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - name: Install dependencies
-        run: |
-          pip install --upgrade gdown
+      - name: Install gdown
+        run: pip install --no-cache-dir gdown
 
-      - name: Download Google Drive folder tree
-        run: |
-          mkdir -p gdrive_raw
-          gdown --folder "https://drive.google.com/drive/folders/1BfeK39boriHy-9q76eXLLqbCwfV17-Gv" -O gdrive_raw
-
-      - name: Identify app version & check release status
-        id: check_release
-        run: |
-          APP_DIR=$(find gdrive_raw -type d -name "MiXplorer-v*" | sort -V | tail -1)
-
-          if [ -z "$APP_DIR" ]; then
-            echo "::error::Could not find 'MiXplorer-v*' directory"
-            exit 1
-          fi
-
-          FOLDER_NAME=$(basename "$APP_DIR")
-          VERSION_NAME=$(echo "$FOLDER_NAME" | sed 's/^MiXplorer-v//')
-          echo "Found version directory: $FOLDER_NAME (Version: $VERSION_NAME)"
-
-          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
-          AAPT="${BUILD_TOOLS}aapt"
-
-          MAX_VC=0
-          shopt -s globstar nullglob
-          for apk in "$APP_DIR"/*.apk; do
-            VC=$("$AAPT" dump badging "$apk" 2>/dev/null | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
-            if [ -n "$VC" ] && [ "$VC" -gt "$MAX_VC" ]; then
-              MAX_VC=$VC
-            fi
-          done
-
-          if [ "$MAX_VC" -eq 0 ]; then
-            echo "::error::Failed to read versionCode from APKs inside $APP_DIR"
-            exit 1
-          fi
-
-          TAG="v${VERSION_NAME}+${MAX_VC}"
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
-          echo "APP_DIR=$APP_DIR" >> $GITHUB_ENV
-
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
-
-          if [ "$CODE" = "200" ]; then
-            echo "RELEASE_EXISTS=true" >> $GITHUB_ENV
-            echo "Release $TAG already exists. Skipping."
-          else
-            echo "RELEASE_EXISTS=false" >> $GITHUB_ENV
-          fi
-
-      - name: Verify signatures, prune architectures, and stage assets
-        if: env.RELEASE_EXISTS == 'false'
+      - name: Sync, verify, and generate release metadata
+        id: sync
         env:
-          EXPECTED: "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EXPECTED_CERT: "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256"
         run: |
-          mkdir -p release_assets
-          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
-          APKSIGNER="${BUILD_TOOLS}apksigner"
-          AAPT="${BUILD_TOOLS}aapt"
+          python3 - << 'EOF'
+          import os, sys, re, glob, hashlib, subprocess, requests, gdown
+          from concurrent.futures import ThreadPoolExecutor
 
-          # Use sed to strip YAML indentation spaces so Markdown tables parse correctly
-          cat << 'EOF' | sed 's/^[ \t]*//' > release_notes.md
-          Mirrored from official Google Drive distribution.
+          FOLDER_URL = "https://drive.google.com/drive/folders/1BfeK39boriHy-9q76eXLLqbCwfV17-Gv"
+          HEADERS = {"Authorization": f"token {os.environ['GITHUB_TOKEN']}"}
+          REPO = os.environ['REPO']
+          EXPECTED_CERT = os.environ.get('EXPECTED_CERT', '').strip()
 
-          ### Core Application
+          # 1. Fast probe Google Drive file index without downloading
+          print("Querying Google Drive index...")
+          items = gdown.download_folder(FOLDER_URL, skip_download=True, quiet=True)
 
-          | File | Package | Version | SHA-256 |
-          | :--- | :--- | :--- | :--- |
+          # 2. Prune non-target architectures in memory
+          target_items = [
+              item for item in items
+              if item.path.endswith('.apk') and not any(
+                  arch in os.path.basename(item.path)
+                  for arch in ['-x86.apk', '-x64.apk', '-arm.apk', '-API29']
+              )
+          ]
+          print(f"Targeting {len(target_items)} modern/universal APKs.")
+
+          # 3. Diff against latest release on GitHub
+          res = requests.get(f"https://api.github.com/repos/{REPO}/releases/latest", headers=HEADERS)
+          published_assets = {a["name"] for a in res.json().get("assets", [])} if res.status_code == 200 else set()
+          drive_filenames = {os.path.basename(i.path) for i in target_items}
+          new_or_updated = [fn for fn in drive_filenames if fn not in published_assets]
+
+          if not new_or_updated and published_assets:
+              print("No new updates found. Exiting early.")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write("should_release=false\n")
+              sys.exit(0)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write("should_release=true\n")
+
+          # 4. Determine version strings & tag
+          core_version = "unknown"
+          for item in target_items:
+              m = re.search(r'MiXplorer-v([^/\\]+)', item.path)
+              if m:
+                  core_version = m.group(1)
+                  break
+
+          build_codes = [
+              int(m.group(1)) for item in target_items
+              if (m := re.search(r'_B(\d+)', os.path.basename(item.path)))
+          ]
+          max_build = max(build_codes) if build_codes else 0
+          release_tag = f"v{core_version}+{max_build}"
+
+          # 5. Parallel download
+          os.makedirs("release_assets", exist_ok=True)
+          def download_file(item):
+              fn = os.path.basename(item.path)
+              dest = os.path.join("release_assets", fn)
+              gdown.download(f"https://drive.google.com/uc?id={item.id}", output=dest, quiet=True)
+              return fn
+
+          print(f"Downloading {len(target_items)} APKs concurrently...")
+          with ThreadPoolExecutor(max_workers=6) as pool:
+              list(pool.map(download_file, target_items))
+
+          # 6. Locate Android SDK tools
+          build_tools = sorted(glob.glob(f"{os.environ['ANDROID_HOME']}/build-tools/*"))[-1]
+          apksigner = os.path.join(build_tools, "apksigner")
+          aapt = os.path.join(build_tools, "aapt")
+
+          # 7. Verification & metadata extraction
+          core_rows = []
+          addon_rows = []
+
+          for apk_path in sorted(glob.glob("release_assets/*.apk")):
+              fn = os.path.basename(apk_path)
+
+              # Check zip structure
+              if subprocess.run(["unzip", "-t", apk_path], stdout=subprocess.DEVNULL).returncode != 0:
+                  print(f"::error::Corrupt archive: {fn}")
+                  sys.exit(1)
+
+              # Verify signature
+              cert_out = subprocess.check_output([apksigner, "verify", "--print-certs", apk_path], text=True)
+              cert_match = re.search(r'SHA-256 digest:\s*([0-9a-fA-F]+)', cert_out)
+              actual_cert = cert_match.group(1).lower() if cert_match else ""
+
+              if EXPECTED_CERT == "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256":
+                  print(f"::warning::Certificate hash not configured. Set EXPECTED_CERT to: {actual_cert}")
+              elif actual_cert != EXPECTED_CERT.lower():
+                  print(f"::error::Certificate mismatch on {fn} (Got: {actual_cert})")
+                  sys.exit(1)
+
+              # Parse AAPT
+              dump = subprocess.check_output([aapt, "dump", "badging", apk_path], text=True, errors="ignore")
+              pkg = (re.search(r"package: name='([^']*)'", dump) or [None, ""])[1]
+              vn = (re.search(r"versionName='([^']*)'", dump) or [None, ""])[1]
+              vc = (re.search(r"versionCode='([^']*)'", dump) or [None, ""])[1]
+
+              # Native SHA-256
+              with open(apk_path, "rb") as f:
+                  sha = hashlib.sha256(f.read()).hexdigest()
+
+              row = f"| `{fn}` | `{pkg}` | {vn} ({vc}) | `{sha}` |\n"
+              if fn.startswith("MiXplorer_"):
+                  core_rows.append(row)
+              else:
+                  addon_rows.append(row)
+
+          # 8. Render Markdown release notes
+          with open("release_notes.md", "w") as md:
+              md.write("Mirrored from official Google Drive distribution.\n\n")
+              md.write("### What's Changed\n")
+              if not published_assets:
+                  md.write("- Initial mirror synchronization.\n\n")
+              else:
+                  md.write("**Updated in this release:**\n")
+                  for f in new_or_updated:
+                      md.write(f"- `{f}`\n")
+                  md.write("\n")
+
+              md.write("### Core Application\n\n| File | Package | Version | SHA-256 |\n| :--- | :--- | :--- | :--- |\n")
+              md.writelines(core_rows)
+              md.write("\n### Official Add-ons\n\n| File | Package | Version | SHA-256 |\n| :--- | :--- | :--- | :--- |\n")
+              md.writelines(addon_rows)
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"RELEASE_TAG={release_tag}\n")
+              f.write(f"CORE_VERSION={core_version}\n")
           EOF
-
-          shopt -s globstar nullglob
-
-          # 1. Process Core MiXplorer APKs (Skip x86, x64, 32-bit arm, and legacy API29)
-          for apk in "${{ env.APP_DIR }}"/*.apk; do
-            [ -f "$apk" ] || continue
-
-            case "$apk" in
-              *-x86.apk|*-x64.apk|*-arm.apk|*-API29*)
-                echo "Skipping non-target architecture: $apk"
-                continue
-                ;;
-            esac
-
-            unzip -t "$apk" > /dev/null || { echo "Corrupt APK: $apk"; exit 1; }
-
-            ACTUAL=$("$APKSIGNER" verify --print-certs "$apk" \
-              | sed -n 's/.*SHA-256 digest: \([0-9a-f]*\).*/\1/p' | head -1)
-
-            if [ "$EXPECTED" != "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-              echo "::error::Signature mismatch on $apk"
-              exit 1
-            fi
-
-            FILE=$(basename "$apk")
-            DUMP=$("$AAPT" dump badging "$apk" 2>/dev/null || true)
-            PKG=$(echo "$DUMP" | sed -n "s/.*package: name='\([^']*\)'.*/\1/p")
-            VN=$(echo "$DUMP" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
-            VC=$(echo "$DUMP" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
-            SHA=$(sha256sum "$apk" | cut -d' ' -f1)
-
-            printf "| \`%s\` | \`%s\` | %s (%s) | \`%s\` |\n" "$FILE" "$PKG" "$VN" "$VC" "$SHA" >> release_notes.md
-            cp "$apk" release_assets/
-          done
-
-          cat << 'EOF' | sed 's/^[ \t]*//' >> release_notes.md
-
-          ### Official Add-ons
-
-          | File | Add-on | Package | Version | SHA-256 |
-          | :--- | :--- | :--- | :--- | :--- |
-          EOF
-
-          # 2. Process Add-ons (ARM64 & Universal only)
-          for apk in gdrive_raw/**/*.apk; do
-            [ -f "$apk" ] || continue
-
-            case "$apk" in
-              "${{ env.APP_DIR }}"*) continue ;;
-              *-x86.apk|*-x64.apk|*-arm.apk)
-                echo "Skipping non-target architecture: $apk"
-                continue
-                ;;
-            esac
-
-            unzip -t "$apk" > /dev/null || { echo "Corrupt Add-on APK: $apk"; exit 1; }
-
-            ACTUAL=$("$APKSIGNER" verify --print-certs "$apk" \
-              | sed -n 's/.*SHA-256 digest: \([0-9a-f]*\).*/\1/p' | head -1)
-
-            if [ "$EXPECTED" != "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-              echo "::error::Signature mismatch on $apk"
-              exit 1
-            fi
-
-            FILE=$(basename "$apk")
-            FOLDER=$(basename "$(dirname "$apk")")
-            DUMP=$("$AAPT" dump badging "$apk" 2>/dev/null || true)
-            PKG=$(echo "$DUMP" | sed -n "s/.*package: name='\([^']*\)'.*/\1/p")
-            VN=$(echo "$DUMP" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
-            VC=$(echo "$DUMP" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
-            SHA=$(sha256sum "$apk" | cut -d' ' -f1)
-
-            printf "| \`%s\` | %s | \`%s\` | %s (%s) | \`%s\` |\n" "$FILE" "$FOLDER" "$PKG" "$VN" "$VC" "$SHA" >> release_notes.md
-            cp "$apk" release_assets/
-          done
 
       - name: Create release
-        if: env.RELEASE_EXISTS == 'false'
+        if: steps.sync.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG }}
-          name: MiXplorer ${{ env.VERSION_NAME }} + Add-ons
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: MiXplorer ${{ env.CORE_VERSION }} + Add-ons
           body_path: release_notes.md
           files: release_assets/*.apk
         env:
