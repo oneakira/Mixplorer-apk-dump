@@ -60,24 +60,26 @@ jobs:
               sys.exit(0)
 
           # 3. Extract Changelog from HTML header box
-          header_part = re.split(r'href=["\'][^"\']+\.apk', html, flags=re.IGNORECASE)[0]
-          # Strip head, scripts, and styles
+          header_part = re.split(r'<a\b[^>]*\.apk', html, flags=re.IGNORECASE)[0]
+
+          # Strip head, scripts, styles, and comments
           header_part = re.sub(r'<head[^>]*>.*?</head>', '', header_part, flags=re.IGNORECASE | re.DOTALL)
           header_part = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', header_part, flags=re.IGNORECASE | re.DOTALL)
-          
+
           # Convert bullets and notes headers into clean lines
           header_part = re.sub(r'\bnotes:\s*', '\n\n**Notes:**\n', header_part, flags=re.IGNORECASE)
           header_part = header_part.replace('•', '\n- ')
           header_part = re.sub(r'<(br|p|div|li|hr)[^>]*>', '\n', header_part, flags=re.IGNORECASE)
-          
-          # Clean tags and entities
+
+          # Clean tags, strip unclosed trailing brackets, and unescape entities
           clean_text = re.sub(r'<[^>]+>', '', header_part)
+          clean_text = re.sub(r'<[^>]*$', '', clean_text)  # Remove any incomplete opening tag at the end
           clean_text = html_lib.unescape(clean_text)
 
           changelog_items = []
           for raw_line in clean_text.splitlines():
               line = raw_line.strip()
-              if not line or "mix beta" in line.lower():
+              if not line or "mix beta" in line.lower() or line.startswith('<'):
                   continue
               if line == '**Notes:**':
                   changelog_items.append('\n**Notes:**')
