@@ -1,0 +1,162 @@
+name: Mirror MiXplorer Beta
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # Runs at :17 past the hour every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-mixplorer-beta
+  cancel-in-progress: false
+
+jobs:
+  mirror-beta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect, sync, and verify beta APKs
+        id: sync
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EXPECTED_CERT: "724eebd26a756e0762c255052e49709391baa21d17d98c34071e091f18b90063"
+        run: |
+          python3 - << 'EOF'
+          import os, sys, re, glob, hashlib, subprocess, urllib.request, urllib.parse
+          from concurrent.futures import ThreadPoolExecutor
+
+          BASE_URL = "https://mixplorer.com/beta/"
+          REPO = os.environ['REPO']
+          TOKEN = os.environ['GITHUB_TOKEN']
+          EXPECTED_CERT = os.environ['EXPECTED_CERT'].strip().lower()
+
+          # 1. Fetch directory listing
+          print(f"Checking {BASE_URL}...")
+          req = urllib.request.Request(BASE_URL, headers={"User-Agent": "Mozilla/5.0"})
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  html = resp.read().decode('utf-8', errors='ignore')
+          except Exception as e:
+              print(f"::error::Failed to access beta directory: {e}")
+              sys.exit(1)
+
+          raw_links = re.findall(r'href=["\']([^"\']+\.apk)["\']', html, re.IGNORECASE)
+          apk_urls = list(dict.fromkeys([urllib.parse.urljoin(BASE_URL, l) for l in raw_links]))
+
+          # 2. Prune obsolete architectures before download
+          target_urls = [
+              url for url in apk_urls
+              if not any(arch in os.path.basename(url) for arch in ['-x86.apk', '-x64.apk', '-arm.apk', '-API29'])
+          ]
+
+          if not target_urls:
+              print("No target APKs discovered in directory listing.")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write("should_release=false\n")
+              sys.exit(0)
+
+          # 3. Determine prospective version and tag
+          core_version = "beta"
+          build_codes = []
+          for url in target_urls:
+              fn = os.path.basename(url)
+              vm = re.search(r'MiXplorer_v?([0-9.]+)', fn)
+              if vm:
+                  core_version = vm.group(1)
+              bm = re.search(r'_B(\d+)', fn)
+              if bm:
+                  build_codes.append(int(bm.group(1)))
+
+          max_build = max(build_codes) if build_codes else 0
+          release_tag = f"v{core_version}-beta+{max_build}"
+          print(f"Targeting build tag: {release_tag}")
+
+          # 4. Fast-path check: skip downloading if release tag exists
+          check_req = urllib.request.Request(
+              f"https://api.github.com/repos/{REPO}/releases/tags/{release_tag}",
+              headers={"Authorization": f"token {TOKEN}", "User-Agent": "GitHub-Action"}
+          )
+          try:
+              with urllib.request.urlopen(check_req) as check_resp:
+                  if check_resp.status == 200:
+                      print(f"Release {release_tag} already published. Nothing to do.")
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write("should_release=false\n")
+                      sys.exit(0)
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  print(f"::warning::GitHub API returned unexpected status: {e.code}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write("should_release=true\n")
+
+          # 5. Parallel download only targeted files
+          os.makedirs("beta_assets", exist_ok=True)
+          def download(url):
+              fn = os.path.basename(url)
+              dest = os.path.join("beta_assets", fn)
+              d_req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(d_req) as src, open(dest, "wb") as out:
+                  out.write(src.read())
+              return fn
+
+          print(f"Downloading {len(target_urls)} beta APKs...")
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              list(pool.map(download, target_urls))
+
+          # 6. Verify signatures and construct markdown
+          build_tools = sorted(glob.glob(f"{os.environ['ANDROID_HOME']}/build-tools/*"))[-1]
+          apksigner = os.path.join(build_tools, "apksigner")
+          aapt = os.path.join(build_tools, "aapt")
+
+          rows = []
+          for apk_path in sorted(glob.glob("beta_assets/*.apk")):
+              fn = os.path.basename(apk_path)
+
+              if subprocess.run(["unzip", "-t", apk_path], stdout=subprocess.DEVNULL).returncode != 0:
+                  print(f"::error::Corrupt archive: {fn}")
+                  sys.exit(1)
+
+              cert_out = subprocess.check_output([apksigner, "verify", "--print-certs", apk_path], text=True)
+              cert_match = re.search(r'SHA-256 digest:\s*([0-9a-fA-F]+)', cert_out)
+              actual_cert = cert_match.group(1).lower() if cert_match else ""
+
+              if actual_cert != EXPECTED_CERT:
+                  print(f"::error::Signing mismatch on {fn} (Got: {actual_cert})")
+                  sys.exit(1)
+
+              dump = subprocess.check_output([aapt, "dump", "badging", apk_path], text=True, errors="ignore")
+              pkg = (re.search(r"package: name='([^']*)'", dump) or [None, ""])[1]
+              vn = (re.search(r"versionName='([^']*)'", dump) or [None, ""])[1]
+              vc = (re.search(r"versionCode='([^']*)'", dump) or [None, ""])[1]
+
+              with open(apk_path, "rb") as f:
+                  sha = hashlib.sha256(f.read()).hexdigest()
+
+              rows.append(f"| `{fn}` | `{pkg}` | {vn} ({vc}) | `{sha}` |\n")
+
+          with open("beta_release_notes.md", "w") as md:
+              md.write("Mirrored from https://mixplorer.com/beta/\n\n")
+              md.write("> **Notice:** This is an unstable pre-release build.\n\n")
+              md.write("### Targeted Packages\n\n| File | Package | Version | SHA-256 |\n| :--- | :--- | :--- | :--- |\n")
+              md.writelines(rows)
+
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"RELEASE_TAG={release_tag}\n")
+              f.write(f"CORE_VERSION={core_version}\n")
+          EOF
+
+      - name: Create pre-release
+        if: steps.sync.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: MiXplorer ${{ env.CORE_VERSION }} Beta
+          prerelease: true
+          body_path: beta_release_notes.md
+          files: beta_assets/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
