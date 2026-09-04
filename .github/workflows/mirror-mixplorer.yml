@@ -25,7 +25,7 @@ jobs:
         run: |
           mkdir -p gdrive_raw
           # Download public folder and subdirectories recursively
-          gdown --folder "https://drive.google.com/drive/folders/1BfeK39boriHy-9q76eXLLqbCwfV17-Gv" -O gdrive_raw --remaining-ok
+          gdown --folder "https://drive.google.com/drive/folders/1BfeK39boriHy-9q76eXLLqbCwfV17-Gv" -O gdrive_raw
 
       - name: Identify app version & check release status
         id: check_release
