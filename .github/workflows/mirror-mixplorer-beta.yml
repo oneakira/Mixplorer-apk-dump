@@ -26,6 +26,7 @@ jobs:
         run: |
           python3 - << 'EOF'
           import os, sys, re, glob, hashlib, subprocess, urllib.request, urllib.parse
+          import html as html_lib
           from concurrent.futures import ThreadPoolExecutor
 
           BASE_URL = "https://mixplorer.com/beta/"
@@ -58,7 +59,39 @@ jobs:
                   f.write("should_release=false\n")
               sys.exit(0)
 
-          # 3. Determine prospective version and tag
+          # 3. Extract Changelog from HTML header box
+          header_part = re.split(r'href=["\'][^"\']+\.apk', html, flags=re.IGNORECASE)[0]
+          # Strip head, scripts, and styles
+          header_part = re.sub(r'<head[^>]*>.*?</head>', '', header_part, flags=re.IGNORECASE | re.DOTALL)
+          header_part = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', header_part, flags=re.IGNORECASE | re.DOTALL)
+          
+          # Convert bullets and notes headers into clean lines
+          header_part = re.sub(r'\bnotes:\s*', '\n\n**Notes:**\n', header_part, flags=re.IGNORECASE)
+          header_part = header_part.replace('•', '\n- ')
+          header_part = re.sub(r'<(br|p|div|li|hr)[^>]*>', '\n', header_part, flags=re.IGNORECASE)
+          
+          # Clean tags and entities
+          clean_text = re.sub(r'<[^>]+>', '', header_part)
+          clean_text = html_lib.unescape(clean_text)
+
+          changelog_items = []
+          for raw_line in clean_text.splitlines():
+              line = raw_line.strip()
+              if not line or "mix beta" in line.lower():
+                  continue
+              if line == '**Notes:**':
+                  changelog_items.append('\n**Notes:**')
+                  continue
+              if line.startswith(('-', '*', '•')):
+                  bullet = line.lstrip('-*• ').strip()
+                  if bullet:
+                      changelog_items.append(f"- {bullet}")
+              else:
+                  changelog_items.append(f"- {line}")
+
+          changelog_md = "\n".join(changelog_items) if changelog_items else "- Routine beta maintenance and performance optimizations."
+
+          # 4. Determine prospective version and tag
           core_version = "beta"
           build_codes = []
           for url in target_urls:
@@ -74,7 +107,7 @@ jobs:
           release_tag = f"v{core_version}-beta+{max_build}"
           print(f"Targeting build tag: {release_tag}")
 
-          # 4. Fast-path check: skip downloading if release tag exists
+          # 5. Fast-path check: skip downloading if release tag exists
           check_req = urllib.request.Request(
               f"https://api.github.com/repos/{REPO}/releases/tags/{release_tag}",
               headers={"Authorization": f"token {TOKEN}", "User-Agent": "GitHub-Action"}
@@ -93,7 +126,7 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write("should_release=true\n")
 
-          # 5. Parallel download only targeted files
+          # 6. Parallel download only targeted files
           os.makedirs("beta_assets", exist_ok=True)
           def download(url):
               fn = os.path.basename(url)
@@ -107,7 +140,7 @@ jobs:
           with ThreadPoolExecutor(max_workers=4) as pool:
               list(pool.map(download, target_urls))
 
-          # 6. Verify signatures and construct markdown
+          # 7. Verify signatures and construct markdown
           build_tools = sorted(glob.glob(f"{os.environ['ANDROID_HOME']}/build-tools/*"))[-1]
           apksigner = os.path.join(build_tools, "apksigner")
           aapt = os.path.join(build_tools, "aapt")
@@ -140,6 +173,8 @@ jobs:
 
           with open("beta_release_notes.md", "w") as md:
               md.write("Mirrored from official [Beta](https://mixplorer.com/beta/) distributions.\n\n")
+              md.write("### Changelog\n\n")
+              md.write(f"{changelog_md}\n\n")
               md.write("### Targeted Packages\n\n| File | Package | Version | SHA-256 |\n| :--- | :--- | :--- | :--- |\n")
               md.writelines(rows)
 
