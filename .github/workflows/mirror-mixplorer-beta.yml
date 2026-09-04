@@ -139,7 +139,7 @@ jobs:
               rows.append(f"| `{fn}` | `{pkg}` | {vn} ({vc}) | `{sha}` |\n")
 
           with open("beta_release_notes.md", "w") as md:
-              md.write("Mirrored from https://mixplorer.com/beta/\n\n")
+              md.write("Mirrored from official [Beta](https://mixplorer.com/beta/) distributions.\n\n")
               md.write("### Targeted Packages\n\n| File | Package | Version | SHA-256 |\n| :--- | :--- | :--- | :--- |\n")
               md.writelines(rows)
 
