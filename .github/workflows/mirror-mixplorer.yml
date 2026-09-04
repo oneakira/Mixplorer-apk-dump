@@ -24,17 +24,15 @@ jobs:
       - name: Download Google Drive folder tree
         run: |
           mkdir -p gdrive_raw
-          # Download public folder and subdirectories recursively
           gdown --folder "https://drive.google.com/drive/folders/1BfeK39boriHy-9q76eXLLqbCwfV17-Gv" -O gdrive_raw
 
       - name: Identify app version & check release status
         id: check_release
         run: |
-          # Locate the MiXplorer-v* subfolder dynamically
           APP_DIR=$(find gdrive_raw -type d -name "MiXplorer-v*" | sort -V | tail -1)
 
           if [ -z "$APP_DIR" ]; then
-            echo "::error::Could not find 'MiXplorer-v*' directory in downloaded files"
+            echo "::error::Could not find 'MiXplorer-v*' directory"
             exit 1
           fi
 
@@ -42,7 +40,6 @@ jobs:
           VERSION_NAME=$(echo "$FOLDER_NAME" | sed 's/^MiXplorer-v//')
           echo "Found version directory: $FOLDER_NAME (Version: $VERSION_NAME)"
 
-          # Extract highest versionCode from APKs inside the versioned folder
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
           AAPT="${BUILD_TOOLS}aapt"
 
@@ -65,23 +62,20 @@ jobs:
           echo "VERSION_NAME=$VERSION_NAME" >> $GITHUB_ENV
           echo "APP_DIR=$APP_DIR" >> $GITHUB_ENV
 
-          # Check if this tag already exists on GitHub
           CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG}")
 
-          echo "Release status code: $CODE"
           if [ "$CODE" = "200" ]; then
             echo "RELEASE_EXISTS=true" >> $GITHUB_ENV
-            echo "Release $TAG already exists. Skipping further processing."
+            echo "Release $TAG already exists. Skipping."
           else
             echo "RELEASE_EXISTS=false" >> $GITHUB_ENV
           fi
 
-      - name: Verify signatures and stage release assets
+      - name: Verify signatures, prune architectures, and stage assets
         if: env.RELEASE_EXISTS == 'false'
         env:
-          # Developer cert SHA-256 fingerprint for verification
           EXPECTED: "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256"
         run: |
           mkdir -p release_assets
@@ -89,19 +83,29 @@ jobs:
           APKSIGNER="${BUILD_TOOLS}apksigner"
           AAPT="${BUILD_TOOLS}aapt"
 
-          cat << 'EOF' > release_notes.md
+          # Use sed to strip YAML indentation spaces so Markdown tables parse correctly
+          cat << 'EOF' | sed 's/^[ \t]*//' > release_notes.md
           Mirrored from official Google Drive distribution.
 
           ### Core Application
+
           | File | Package | Version | SHA-256 |
-          |---|---|---|---|
+          | :--- | :--- | :--- | :--- |
           EOF
 
           shopt -s globstar nullglob
 
-          # 1. Process Core MiXplorer APKs
+          # 1. Process Core MiXplorer APKs (Skip x86, x64, 32-bit arm, and legacy API29)
           for apk in "${{ env.APP_DIR }}"/*.apk; do
             [ -f "$apk" ] || continue
+
+            case "$apk" in
+              *-x86.apk|*-x64.apk|*-arm.apk|*-API29*)
+                echo "Skipping non-target architecture: $apk"
+                continue
+                ;;
+            esac
+
             unzip -t "$apk" > /dev/null || { echo "Corrupt APK: $apk"; exit 1; }
 
             ACTUAL=$("$APKSIGNER" verify --print-certs "$apk" \
@@ -119,24 +123,28 @@ jobs:
             VC=$(echo "$DUMP" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
             SHA=$(sha256sum "$apk" | cut -d' ' -f1)
 
-            echo "| \`$FILE\` | \`$PKG\` | $VN ($VC) | \`$SHA\` |" >> release_notes.md
+            printf "| \`%s\` | \`%s\` | %s (%s) | \`%s\` |\n" "$FILE" "$PKG" "$VN" "$VC" "$SHA" >> release_notes.md
             cp "$apk" release_assets/
           done
 
-          cat << 'EOF' >> release_notes.md
+          cat << 'EOF' | sed 's/^[ \t]*//' >> release_notes.md
 
           ### Official Add-ons
-          | File | Source Folder | Package | Version | SHA-256 |
-          |---|---|---|---|---|
+
+          | File | Add-on | Package | Version | SHA-256 |
+          | :--- | :--- | :--- | :--- | :--- |
           EOF
 
-          # 2. Process Add-ons (skipping the main version directory)
+          # 2. Process Add-ons (ARM64 & Universal only)
           for apk in gdrive_raw/**/*.apk; do
             [ -f "$apk" ] || continue
 
-            # Skip if file belongs to the main app folder
             case "$apk" in
               "${{ env.APP_DIR }}"*) continue ;;
+              *-x86.apk|*-x64.apk|*-arm.apk)
+                echo "Skipping non-target architecture: $apk"
+                continue
+                ;;
             esac
 
             unzip -t "$apk" > /dev/null || { echo "Corrupt Add-on APK: $apk"; exit 1; }
@@ -157,7 +165,7 @@ jobs:
             VC=$(echo "$DUMP" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
             SHA=$(sha256sum "$apk" | cut -d' ' -f1)
 
-            echo "| \`$FILE\` | $FOLDER | \`$PKG\` | $VN ($VC) | \`$SHA\` |" >> release_notes.md
+            printf "| \`%s\` | %s | \`%s\` | %s (%s) | \`%s\` |\n" "$FILE" "$FOLDER" "$PKG" "$VN" "$VC" "$SHA" >> release_notes.md
             cp "$apk" release_assets/
           done
 
