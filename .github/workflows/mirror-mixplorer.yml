@@ -25,7 +25,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          EXPECTED_CERT: "REPLACE_WITH_ACTUAL_MIXPLORER_CERT_SHA256"
+          EXPECTED_CERT: "724eebd26a756e0762c255052e49709391baa21d17d98c34071e091f18b90063"
         run: |
           python3 - << 'EOF'
           import os, sys, re, glob, hashlib, subprocess, requests, gdown
