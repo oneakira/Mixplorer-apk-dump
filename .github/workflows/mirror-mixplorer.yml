@@ -138,7 +138,7 @@ jobs:
 
           # 8. Render Markdown release notes
           with open("release_notes.md", "w") as md:
-              md.write("Mirrored from official Google Drive distribution.\n\n")
+              md.write("Mirrored from official [Google Drive](https://drive.google.com/drive/folders/1BfeK39boriHy-9q76eXLLqbCwfV17-Gv) distribution.\n\n")
               md.write("### What's Changed\n")
               if not published_assets:
                   md.write("- Initial mirror synchronization.\n\n")
