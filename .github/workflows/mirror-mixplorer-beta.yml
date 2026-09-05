@@ -36,8 +36,7 @@ jobs:
 
           # 1. Fetch directory listing (Force IPv4 + Retry loop)
           import socket, time
-          
-          # Force IPv4 across all urllib requests to avoid GitHub Actions IPv6 routing drops
+
           orig_getaddrinfo = socket.getaddrinfo
           def getaddrinfo_ipv4(host, port, family=0, *args, **kwargs):
               return orig_getaddrinfo(host, port, socket.AF_INET, *args, **kwargs)
@@ -57,6 +56,10 @@ jobs:
                       print(f"::error::Failed to access beta directory after 3 attempts: {e}")
                       sys.exit(1)
                   time.sleep(5)
+
+          # Extract APK links from fetched HTML
+          raw_links = re.findall(r'href=["\']([^"\']+\.apk)["\']', html, re.IGNORECASE)
+          apk_urls = list(dict.fromkeys([urllib.parse.urljoin(BASE_URL, l) for l in raw_links]))
 
           # 2. Prune obsolete architectures before download
           target_urls = [
